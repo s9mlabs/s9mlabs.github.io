@@ -1,7 +1,8 @@
 name: stage-media
-# Fetches this round's generated clips and stills, turns each clip into a seamless forward loop (a short
-# dissolve from the end back into the start, nothing plays backwards), writes phone versions and posters,
-# and commits the results to this branch for review. Nothing here touches the live site. (round 8)
+# Fetches this round's generated clips and stills and turns each clip into a seamless loop with no ghosting:
+# the slow camera move is taken out first (every frame aligned to the last), then the end dissolves into the
+# start. Writes phone versions and posters and commits everything to this branch for review. Nothing here
+# touches the live site. (round 8, steadied loops)
 on:
   workflow_dispatch:
   push:
@@ -12,7 +13,7 @@ permissions:
 jobs:
   media:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Fetch the generated media
@@ -26,10 +27,10 @@ jobs:
           f mea.png hf_20261108_233103_9b2769b4-a3ae-4b0c-99fd-619169aadf1d.png
           f grid.png hf_20261108_233103_cdb0a34f-ce2a-4f48-9ebf-9b5e651dcf34.png
           ls -la _raw
-      - name: Get ffmpeg
+      - name: Tools
         run: |
           set -e
-          python3 -m pip install --quiet imageio-ffmpeg
+          python3 -m pip install --quiet imageio-ffmpeg opencv-python-headless numpy
           FF=$(python3 -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
           if ! "$FF" -hide_banner -encoders 2>/dev/null | grep -q libx264; then
             sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
@@ -37,24 +38,127 @@ jobs:
           fi
           echo "FF=$FF" >> "$GITHUB_ENV"
           "$FF" -hide_banner -version | head -1
-      - name: Encode loops, phone versions, posters and stills
+          python3 -c "import cv2; print('opencv', cv2.__version__)"
+      - name: Steady loops, phone versions, posters and stills
         run: |
           set -e
-          dur() { python3 -c "import imageio_ffmpeg, sys; print(imageio_ffmpeg.count_frames_and_secs(sys.argv[1])[1])" "$1"; }
-          loop() { # loop <in> <out> <width> <crf> <fade seconds>
-            local D TS FX
-            D=$(dur "$1")
-            TS=$(awk "BEGIN{printf \"%.3f\", $D-$5}")
-            FX=$(awk "BEGIN{printf \"%.3f\", $5-0.06}")
-            "$FF" -y -hide_banner -loglevel error -i "$1" -filter_complex \
-              "[0:v]scale=$3:-2:flags=lanczos,fps=30,format=yuv420p,split=3[a][b][c];[a]trim=start=$TS,setpts=PTS-STARTPTS[tail];[b]trim=end=$5,setpts=PTS-STARTPTS[head];[tail][head]xfade=transition=fade:duration=$FX:offset=0[x];[c]trim=start=$5:end=$TS,setpts=PTS-STARTPTS[mid];[x][mid]concat=n=2:v=1:a=0,format=yuv420p[v]" \
-              -map "[v]" -an -c:v libx264 -preset slow -crf "$4" -g 60 -movflags +faststart "$2"
-          }
-          for n in thesis city; do
-            loop "_raw/$n.mp4" "$n.mp4" 1280 23 1.0
-            loop "_raw/$n.mp4" "$n-m.mp4" 800 27 1.0
-            "$FF" -y -hide_banner -loglevel error -ss 0.5 -i "$n.mp4" -frames:v 1 -q:v 3 "$n.jpg"
-          done
+          cat > /tmp/steady_loop.py <<'PY'
+          #!/usr/bin/env python3
+          """Turn a slowly drifting generated clip into a seamless loop with no ghosting.
+
+          The clips push in slowly, so a plain dissolve from the end back to the start shows two overlapping copies of the
+          scene. Here every frame is first aligned to the last frame of the chosen range (the camera move is taken out; only
+          the light moving inside the scene is left), and then the last few frames dissolve into the first ones. The page adds
+          its own slow drift on top.
+
+          usage: steady_loop.py IN OUT_PREFIX --start S --end E --fade F [--model similarity|homography] [--slow K]
+          writes OUT_PREFIX.mp4 (1280 wide), OUT_PREFIX-m.mp4 (800 wide) and OUT_PREFIX.jpg (poster)
+          """
+          import argparse, subprocess, sys, os, shutil
+          import numpy as np, cv2
+
+          ap = argparse.ArgumentParser()
+          ap.add_argument('src'); ap.add_argument('out')
+          ap.add_argument('--start', type=float, default=0.0); ap.add_argument('--end', type=float, default=99.0)
+          ap.add_argument('--fade', type=float, default=1.2); ap.add_argument('--model', default='similarity')
+          ap.add_argument('--slow', type=float, default=1.0, help='play the result this many times slower (repeats frames)')
+          ap.add_argument('--ffmpeg', default=os.environ.get('FF') or shutil.which('ffmpeg') or 'ffmpeg')
+          a = ap.parse_args()
+
+          cap = cv2.VideoCapture(a.src)
+          fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+          frames = []
+          i = 0
+          while True:
+              ok, f = cap.read()
+              if not ok: break
+              t = i / fps; i += 1
+              if a.start - 1e-6 <= t <= a.end + 1e-6: frames.append(f)
+          if len(frames) < 10: sys.exit('too few frames')
+          H, W = frames[0].shape[:2]
+
+          # 1. how each frame sits relative to the last one (features matched straight to the reference, chained as a fallback)
+          orb = cv2.ORB_create(5000)
+          gray = lambda f: cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+          kd = [orb.detectAndCompute(gray(f), None) for f in frames]
+          bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+          def estimate(i, j):
+              (ka, da), (kb, db) = kd[i], kd[j]
+              if da is None or db is None: return None, 0
+              m = sorted(bf.match(da, db), key=lambda x: x.distance)[:1500]
+              if len(m) < 30: return None, 0
+              pa = np.float32([ka[x.queryIdx].pt for x in m]); pb = np.float32([kb[x.trainIdx].pt for x in m])
+              if a.model == 'homography':
+                  M, inl = cv2.findHomography(pa, pb, cv2.RANSAC, 2.5)
+              else:
+                  A, inl = cv2.estimateAffinePartial2D(pa, pb, method=cv2.RANSAC, ransacReprojThreshold=2.0)
+                  M = None if A is None else np.vstack([A, [0, 0, 1]])
+              return M, (0 if inl is None else int(inl.sum()))
+          ref = len(frames) - 1
+          Ms = [None] * len(frames); Ms[ref] = np.eye(3)
+          for k in range(ref - 1, -1, -1):
+              M, n = estimate(k, ref)
+              if M is None or n < 60:  # chain through the next frame instead
+                  M1, n1 = estimate(k, k + 1)
+                  if M1 is None: M1 = np.eye(3)
+                  M = Ms[k + 1] @ M1
+              Ms[k] = M
+          # smooth the path so small estimation errors don't read as shake
+          P = np.array([m.flatten()[:8] / m[2, 2] for m in Ms])
+          ker = np.ones(7) / 7
+          Ps = np.vstack([np.convolve(np.pad(P[:, c], 3, mode='edge'), ker, mode='valid') for c in range(8)]).T
+          Ms = [np.append(p, 1).reshape(3, 3) for p in Ps]
+          Ms[ref] = np.eye(3)
+
+          # 2. warp every frame into the last frame's view, enlarged just enough about the centre that no frame ever shows an edge
+          def covered(z):
+              C = np.array([[z, 0, (1 - z) * W / 2], [0, z, (1 - z) * H / 2], [0, 0, 1]])
+              pts = np.float32([[0, 0], [W - 1, 0], [W - 1, H - 1], [0, H - 1]]).reshape(-1, 1, 2)
+              for M in Ms:
+                  src = cv2.perspectiveTransform(pts, np.linalg.inv(C @ M)).reshape(-1, 2)
+                  if (src[:, 0] < -0.5).any() or (src[:, 0] > W - 0.5).any() or (src[:, 1] < -0.5).any() or (src[:, 1] > H - 0.5).any():
+                      return None
+              return C
+          crop = 1.0
+          while covered(crop) is None and crop < 1.6: crop += 0.005
+          Cz = covered(crop)
+          if Cz is None: sys.exit('could not cover the frame')
+          steady = [cv2.warpPerspective(f, Cz @ M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT) for f, M in zip(frames, Ms)]
+
+          # 3. slow it down by blending neighbouring frames (the scene holds still now, so this reads as smooth slow light),
+          #    then dissolve the tail into the head
+          if a.slow > 1.0:
+              n = int((len(steady) - 1) * a.slow) + 1
+              slowed = []
+              for k in range(n):
+                  q = k / a.slow; i0 = min(int(q), len(steady) - 1); i1 = min(i0 + 1, len(steady) - 1); w = q - i0
+                  slowed.append(steady[i0] if w < 1e-3 else cv2.addWeighted(steady[i0], 1 - w, steady[i1], w, 0))
+              steady = slowed
+          nf = int(round(a.fade * fps))
+          if nf * 2 >= len(steady): sys.exit('fade too long for this range')
+          L = len(steady) - nf
+          out = []
+          for u in range(nf):  # the first frames of the loop are the tail dissolving into the head
+              w = (u + 1) / (nf + 1); w = w * w * (3 - 2 * w)
+              out.append(cv2.addWeighted(steady[L + u], 1 - w, steady[u], w, 0))
+          out += steady[nf:L]
+
+          def encode(frames, path, width, crf):
+              h = int(round(H * width / W / 2)) * 2
+              p = subprocess.Popen([a.ffmpeg, '-y', '-hide_banner', '-loglevel', 'error', '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', f'{W}x{H}', '-r', str(fps), '-i', '-',
+                                    '-vf', f'scale={width}:{h}:flags=lanczos,format=yuv420p', '-an', '-c:v', 'libx264', '-preset', 'slow', '-crf', str(crf), '-g', '60', '-movflags', '+faststart', path], stdin=subprocess.PIPE)
+              for f in frames: p.stdin.write(f.tobytes())
+              p.stdin.close(); p.wait()
+              if p.returncode: sys.exit('ffmpeg failed for ' + path)
+          encode(out, a.out + '.mp4', 1280, 24)
+          encode(out, a.out + '-m.mp4', 800, 28)
+          cv2.imwrite(a.out + '.jpg', out[len(out) // 3], [cv2.IMWRITE_JPEG_QUALITY, 86])
+          zoom = np.sqrt(abs(np.linalg.det(Ms[0][:2, :2])))
+          seam = float(np.abs(out[0].astype(float) - out[-1].astype(float)).mean())
+          print(f'{a.out}: {len(frames)} frames in, {len(out)} out ({len(out) / fps:.2f}s), extra crop {crop:.3f}x, seam diff {seam:.2f}')
+          PY
+          python3 /tmp/steady_loop.py _raw/thesis.mp4 thesis --start 0.2 --end 5.9 --fade 1.2
+          python3 /tmp/steady_loop.py _raw/city.mp4 city --start 0.4 --end 3.8 --fade 0.9 --model homography --slow 1.5
           "$FF" -y -hide_banner -loglevel error -i _raw/mea.png -vf "scale=720:-2:flags=lanczos" -q:v 3 mea.jpg
           "$FF" -y -hide_banner -loglevel error -i _raw/grid.png -vf "scale=1344:-2:flags=lanczos" -q:v 3 grid.jpg
           ls -la thesis* city* mea.jpg grid.jpg
@@ -63,5 +167,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add thesis.mp4 thesis-m.mp4 thesis.jpg city.mp4 city-m.mp4 city.jpg mea.jpg grid.jpg
-          git commit -m "Stage new background loops and stills for review" || echo "nothing to commit"
+          git commit -m "Stage steadied background loops for review" || echo "nothing to commit"
           git push
