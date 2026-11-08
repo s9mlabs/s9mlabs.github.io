@@ -1,7 +1,7 @@
 name: stage-media
 # Fetches this round's generated clips and stills, turns each clip into a seamless forward loop (a short
 # dissolve from the end back into the start, nothing plays backwards), writes phone versions and posters,
-# and commits the results to this branch for review. Nothing here touches the live site.
+# and commits the results to this branch for review. Nothing here touches the live site. (round 8)
 on:
   workflow_dispatch:
   push:
