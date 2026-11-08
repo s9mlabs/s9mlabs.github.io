@@ -1,0 +1,67 @@
+name: stage-media
+# Fetches this round's generated clips and stills, turns each clip into a seamless forward loop (a short
+# dissolve from the end back into the start, nothing plays backwards), writes phone versions and posters,
+# and commits the results to this branch for review. Nothing here touches the live site.
+on:
+  workflow_dispatch:
+  push:
+    branches: [media-staging]
+    paths: ['.github/workflows/stage-media.yml']
+permissions:
+  contents: write
+jobs:
+  media:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the generated media
+        run: |
+          set -e
+          mkdir -p _raw
+          B="https://d8j0ntlcm91z4.cloudfront.net/user_3LMpeOWZGS5ouZ9e711HxP91GHa"
+          f() { curl -fsSL --retry 3 -o "_raw/$1" "$B/$2"; }
+          f thesis.mp4 hf_20261108_233225_d74e9036-f86d-4e61-83b5-e949b4b2674d.mp4
+          f city.mp4 hf_20261108_233225_9e065dde-0b92-4b1e-a3ec-a0037d5af553.mp4
+          f mea.png hf_20261108_233103_9b2769b4-a3ae-4b0c-99fd-619169aadf1d.png
+          f grid.png hf_20261108_233103_cdb0a34f-ce2a-4f48-9ebf-9b5e651dcf34.png
+          ls -la _raw
+      - name: Get ffmpeg
+        run: |
+          set -e
+          python3 -m pip install --quiet imageio-ffmpeg
+          FF=$(python3 -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
+          if ! "$FF" -hide_banner -encoders 2>/dev/null | grep -q libx264; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg > /dev/null
+            FF=$(command -v ffmpeg)
+          fi
+          echo "FF=$FF" >> "$GITHUB_ENV"
+          "$FF" -hide_banner -version | head -1
+      - name: Encode loops, phone versions, posters and stills
+        run: |
+          set -e
+          dur() { python3 -c "import imageio_ffmpeg, sys; print(imageio_ffmpeg.count_frames_and_secs(sys.argv[1])[1])" "$1"; }
+          loop() { # loop <in> <out> <width> <crf> <fade seconds>
+            local D TS FX
+            D=$(dur "$1")
+            TS=$(awk "BEGIN{printf \"%.3f\", $D-$5}")
+            FX=$(awk "BEGIN{printf \"%.3f\", $5-0.06}")
+            "$FF" -y -hide_banner -loglevel error -i "$1" -filter_complex \
+              "[0:v]scale=$3:-2:flags=lanczos,fps=30,format=yuv420p,split=3[a][b][c];[a]trim=start=$TS,setpts=PTS-STARTPTS[tail];[b]trim=end=$5,setpts=PTS-STARTPTS[head];[tail][head]xfade=transition=fade:duration=$FX:offset=0[x];[c]trim=start=$5:end=$TS,setpts=PTS-STARTPTS[mid];[x][mid]concat=n=2:v=1:a=0,format=yuv420p[v]" \
+              -map "[v]" -an -c:v libx264 -preset slow -crf "$4" -g 60 -movflags +faststart "$2"
+          }
+          for n in thesis city; do
+            loop "_raw/$n.mp4" "$n.mp4" 1280 23 1.0
+            loop "_raw/$n.mp4" "$n-m.mp4" 800 27 1.0
+            "$FF" -y -hide_banner -loglevel error -ss 0.5 -i "$n.mp4" -frames:v 1 -q:v 3 "$n.jpg"
+          done
+          "$FF" -y -hide_banner -loglevel error -i _raw/mea.png -vf "scale=720:-2:flags=lanczos" -q:v 3 mea.jpg
+          "$FF" -y -hide_banner -loglevel error -i _raw/grid.png -vf "scale=1344:-2:flags=lanczos" -q:v 3 grid.jpg
+          ls -la thesis* city* mea.jpg grid.jpg
+      - name: Commit to this branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add thesis.mp4 thesis-m.mp4 thesis.jpg city.mp4 city-m.mp4 city.jpg mea.jpg grid.jpg
+          git commit -m "Stage new background loops and stills for review" || echo "nothing to commit"
+          git push
