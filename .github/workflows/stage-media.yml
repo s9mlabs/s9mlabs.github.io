@@ -1,0 +1,155 @@
+name: stage-media
+# Round 10: makes this round's pictures and the share image from the generated originals and the photos already in the
+# repository, and commits them to this branch. Nothing here touches the live site; merging this branch into main does.
+#   brain.jpg, brain-m.jpg   the brain behind "Where brains become blueprints" (wide and phone versions)
+#   neuron-real.jpg          the real neuron shown next to the 1943 sketch
+#   nikhil.jpg, udeern.jpg   the two headshots, framed a little higher
+#   og.jpg                   the share image, in Mona Sans and Michroma, with the logo
+on:
+  workflow_dispatch:
+  push:
+    branches: [media-staging]
+    paths: ['.github/workflows/stage-media.yml']
+permissions:
+  contents: write
+jobs:
+  media:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: python3 -m pip install --quiet pillow numpy opencv-python-headless
+      - name: Pictures
+        run: |
+          set -e
+          mkdir -p _raw
+          B="https://d8j0ntlcm91z4.cloudfront.net/user_3LMpeOWZGS5ouZ9e711HxP91GHa"
+          curl -fsSL --retry 3 -o _raw/brain.png "$B/hf_20261109_050715_643024d6-3d7f-4a00-8675-d279b53ffbcf.png"
+          curl -fsSL --retry 3 -o _raw/brain-m.png "$B/hf_20261109_050715_e715d13a-afde-4570-83fd-790d7b8197b2.png"
+          cat > /tmp/pics.py <<'PY'
+          import numpy as np, cv2
+          from PIL import Image
+          # the brain: wide version 2200 px across, phone version as generated
+          im = Image.open('_raw/brain.png').convert('RGB')
+          w = 2200; h = round(im.height * w / im.width)
+          im.resize((w, h), Image.LANCZOS).save('brain.jpg', quality=82, optimize=True, progressive=True, subsampling=2)
+          Image.open('_raw/brain-m.png').convert('RGB').save('brain-m.jpg', quality=84, optimize=True, progressive=True, subsampling=2)
+          # the real neuron: a crop of the opening film's still around the cell body
+          n = Image.open('neuron.jpg').convert('RGB'); W, H = n.size
+          cx, cy, cw, ch = int(0.717 * W), int(0.522 * H), 760, 570
+          x0, y0 = cx - cw // 2, cy - ch // 2
+          n.crop((x0, y0, x0 + cw, y0 + ch)).resize((480, 360), Image.LANCZOS).save('neuron-real.jpg', quality=84, optimize=True, progressive=True)
+          # the two headshots, from the original photos, taken a little lower in the frame
+          rng = np.random.default_rng(3)
+          def load(name): return np.asarray(Image.open(name + '.png').convert('L')).astype(np.float32)
+          def fill(img, mask):
+              m = (mask > 0).astype(np.uint8)
+              if not m.any(): return img
+              u8 = np.clip(img, 0, 255).astype(np.uint8)
+              smooth = cv2.inpaint(u8, m, 9, cv2.INPAINT_TELEA).astype(np.float32)
+              hp = img - cv2.GaussianBlur(img, (0, 0), 2)
+              ring = cv2.dilate(m, np.ones((15, 15), np.uint8)) - m
+              sd = float(hp[ring > 0].std()) if ring.any() else 1.0
+              noise = cv2.GaussianBlur(rng.normal(0, 1, img.shape).astype(np.float32), (0, 0), 0.7)
+              noise *= sd / max(noise.std(), 1e-6)
+              return np.where(m > 0, smooth + noise, img)
+          out = {}
+          I = load('nikhil'); hh, ww = I.shape
+          yy, xx = np.mgrid[0:hh, 0:ww]
+          m = (yy < 62) & (I < 244) & ~((xx > 200) & (xx < 450) & (yy > 22))
+          m = cv2.dilate(m.astype(np.uint8), np.ones((5, 5), np.uint8))
+          out['nikhil'] = fill(I, m)[34:639, 17:622]
+          out['udeern'] = load('udeern')[14:640, 7:633]
+          for name, c in out.items():
+              Image.fromarray(np.clip(c, 0, 255).astype(np.uint8)).resize((600, 600), Image.LANCZOS).save(name + '.jpg', quality=90, optimize=True, progressive=True)
+          PY
+          python3 /tmp/pics.py
+          # last round's thesis film is no longer used
+          rm -f thesis.mp4 thesis-m.mp4 thesis.jpg
+          ls -la brain.jpg brain-m.jpg neuron-real.jpg nikhil.jpg udeern.jpg
+      - name: Share image (in the new type, no monospace)
+        # if the render fails, the old share image stays and the pictures above still get committed
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/og && cp neuron.jpg logo.png /tmp/og/
+          cat > /tmp/og/og.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mona+Sans:wdth,wght@75..125,200..900&family=Michroma&display=swap">
+          <style>
+            html, body { margin: 0; background: #03070e; }
+            .og { position: relative; width: 1200px; height: 630px; overflow: hidden; background: #03070e; color: #eef3fb; font-family: 'Mona Sans', sans-serif; }
+            .og img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: 70% 45%; filter: brightness(1) contrast(1.05); }
+            .og .veil { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(3,7,14,0.25) 0%, rgba(3,7,14,0.05) 35%, rgba(3,7,14,0.55) 70%, rgba(3,7,14,0.95) 100%), radial-gradient(ellipse 110% 100% at center, transparent 30%, #03070e 100%); }
+            .brand { position: absolute; left: 56px; top: 48px; display: flex; align-items: center; gap: 14px; font-family: 'Michroma', sans-serif; font-size: 15px; letter-spacing: 0.08em; color: #fff; }
+            .brand i { display: inline-block; width: 24px; height: 29px; background: #fff; -webkit-mask: url(logo.png) center / contain no-repeat; mask: url(logo.png) center / contain no-repeat; }
+            .copy { position: absolute; left: 56px; right: 56px; bottom: 56px; }
+            h1 { margin: 0; font-family: 'Mona Sans', sans-serif; font-weight: 300; font-stretch: 112.5%; font-size: 112px; line-height: 0.98; letter-spacing: -0.05em; }
+            .spike { position: relative; display: inline-block; }
+            .spike svg { position: absolute; left: 0; top: 100%; margin-top: -0.035em; overflow: visible; }
+            .spike path { fill: none; stroke: #4ccbff; stroke-width: 1.8px; stroke-linejoin: round; stroke-linecap: round; }
+            .spike circle { fill: #9fe4ff; filter: drop-shadow(0 0 6px rgba(159, 228, 255, 0.9)); }
+            .sub { margin-top: 46px; font-weight: 400; font-size: 23px; line-height: 1.4; max-width: 760px; color: rgba(238, 243, 251, 0.8); }
+            .sub em { font-style: normal; color: #eef3fb; }
+            .micro { margin-top: 18px; font-family: 'Michroma', sans-serif; font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: #4ccbff; }
+          </style>
+          </head>
+          <body>
+          <div class="og">
+            <img src="neuron.jpg" alt="">
+            <div class="veil"></div>
+            <div class="brand"><i></i><span>s9m LABS</span></div>
+            <div class="copy">
+              <h1>Intelligence,<br><span class="spike" id="spike">computable</span>.</h1>
+              <div class="sub">Making <em>intelligence</em> computable and building <em>intelligent</em> machines.</div>
+              <div class="micro">s9m Labs PBC · Austin, TX</div>
+            </div>
+          </div>
+          <script>
+            document.fonts.ready.then(() => {
+              const s = document.getElementById('spike'), fs = parseFloat(getComputedStyle(s).fontSize), w = s.offsetWidth;
+              const u = fs / 100, h = fs * 0.22, base = h * 0.72, x = w * 0.7;
+              const pts = [[0, base], [x, base], [x + 3 * u, base - 0.8 * u], [x + 5.4 * u, base - 15 * u], [x + 9.4 * u, base + 4.2 * u], [x + 13 * u, base + 1.4 * u], [x + 18 * u, base + 0.4 * u], [x + 24 * u, base], [w, base]];
+              s.insertAdjacentHTML('beforeend', `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><path d="M${pts.map((p) => p.join(' ')).join(' L')}"/><circle r="2.6" cx="${w}" cy="${base}"/></svg>`);
+              document.body.dataset.ready = '1';
+            });
+          </script>
+          </body>
+          </html>
+          HTML
+          cat > /tmp/og/render.js <<'JS'
+          const { chromium } = require('playwright-core');
+          (async () => {
+            const b = await chromium.launch({ channel: 'chrome' });
+            const p = await b.newPage({ viewport: { width: 1200, height: 630 }, deviceScaleFactor: 1 });
+            await p.goto('http://127.0.0.1:8765/og.html', { waitUntil: 'networkidle' });
+            const logo = await p.evaluate(async () => (await fetch('logo.png')).ok);
+            if (!logo) throw new Error('logo missing');
+            await p.evaluate(() => document.fonts.ready);
+            await p.waitForSelector('body[data-ready="1"]', { timeout: 30000 });
+            const ok = await p.evaluate(() => document.fonts.check('300 112px "Mona Sans"') && document.fonts.check('15px "Michroma"'));
+            if (!ok) throw new Error('fonts did not load');
+            await p.waitForTimeout(400);
+            await p.locator('.og').screenshot({ path: 'og.jpg', type: 'jpeg', quality: 86 });
+            await b.close();
+          })().catch((e) => { console.error(e); process.exit(1); });
+          JS
+          cd /tmp/og && npm i --no-save --no-audit --no-fund playwright-core@1.47.2 >/dev/null
+          # served over http: Chrome will not apply the logo (a CSS mask) on a file:// page
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory /tmp/og >/dev/null 2>&1 &
+          sleep 1
+          node render.js
+          cp /tmp/og/og.jpg "$GITHUB_WORKSPACE/og.jpg"
+          ls -l "$GITHUB_WORKSPACE/og.jpg"
+      - name: Commit to this branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -q --cached --ignore-unmatch thesis.mp4 thesis-m.mp4 thesis.jpg
+          git add -A -- brain.jpg brain-m.jpg neuron-real.jpg nikhil.jpg udeern.jpg og.jpg
+          git commit -m "Round 10 pictures and share image" || echo "nothing to commit"
+          git push
