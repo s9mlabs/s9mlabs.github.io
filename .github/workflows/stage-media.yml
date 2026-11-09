@@ -149,6 +149,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A brain.jpg brain-m.jpg neuron-real.jpg nikhil.jpg udeern.jpg og.jpg thesis.mp4 thesis-m.mp4 thesis.jpg
+          git rm -q --cached --ignore-unmatch thesis.mp4 thesis-m.mp4 thesis.jpg
+          git add -A -- brain.jpg brain-m.jpg neuron-real.jpg nikhil.jpg udeern.jpg og.jpg
           git commit -m "Round 10 pictures and share image" || echo "nothing to commit"
           git push
